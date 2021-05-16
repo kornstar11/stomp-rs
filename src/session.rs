@@ -9,12 +9,13 @@ use transaction::Transaction;
 use session_builder::SessionConfig;
 use message_builder::MessageBuilder;
 use subscription_builder::SubscriptionBuilder;
-use tokio_core::net::{TcpStreamNew, TcpStream};
-use tokio_core::reactor::{Timeout, Handle};
-use tokio_io::codec::Framed;
+//use tokio_io::codec::Framed;
 use codec::Codec;
-use tokio_io::AsyncRead;
 use futures::*;
+use async_net::TcpStream;
+use futures::task::{Poll, Context};
+use std::pin::Pin;
+use smol::Timer;
 
 const GRACE_PERIOD_MULTIPLIER: f32 = 2.0;
 
@@ -48,8 +49,8 @@ pub struct SessionState {
     next_receipt_id: u32,
     pub rx_heartbeat_ms: Option<u32>,
     pub tx_heartbeat_ms: Option<u32>,
-    pub rx_heartbeat_timeout: Option<Timeout>,
-    pub tx_heartbeat_timeout: Option<Timeout>,
+    pub rx_heartbeat_timeout: Option<Timer>,
+    pub tx_heartbeat_timeout: Option<Timer>,
     pub subscriptions: HashMap<String, Subscription>,
     pub outstanding_receipts: HashMap<String, OutstandingReceipt>
 }
@@ -114,7 +115,7 @@ impl Session {
         let address = (&self.config.host as &str, self.config.port)
             .to_socket_addrs()?.nth(0)
             .ok_or(io::Error::new(io::ErrorKind::Other, "address provided resolved to nothing"))?;
-        self.stream = StreamState::Connecting(TcpStream::connect(&address, &self.hdl));
+        self.stream = StreamState::Connecting(TcpStream::connect(&address));
         task::current().notify();
         Ok(())
     }
@@ -132,9 +133,9 @@ impl Session {
 }
 // *** pub(crate) API ***
 impl Session {
-    pub(crate) fn new(config: SessionConfig, stream: TcpStreamNew, hdl: Handle) -> Self {
+    pub(crate) fn new(config: SessionConfig, stream: TcpStreamNew) -> Self {
         Self {
-            config, hdl,
+            config,
             state: SessionState::new(),
             events: vec![],
             stream: StreamState::Connecting(stream)
@@ -187,7 +188,7 @@ impl Session {
                    tx_heartbeat_ms);
             return Ok(());
         }
-        let timeout = Timeout::new(Duration::from_millis(tx_heartbeat_ms as _), &self.hdl)?;
+        let timeout = Timer::after(Duration::from_millis(tx_heartbeat_ms as _));
         self.state.tx_heartbeat_timeout = Some(timeout);
         Ok(())
     }
@@ -207,7 +208,7 @@ impl Session {
                    rx_heartbeat_ms);
             return Ok(());
         }
-        let timeout = Timeout::new(Duration::from_millis(rx_heartbeat_ms as _), &self.hdl)?;
+        let timeout = Timer::after(Duration::from_millis(rx_heartbeat_ms as _));
         self.state.rx_heartbeat_timeout = Some(timeout);
         Ok(())
     }
@@ -336,56 +337,56 @@ impl Session {
                 fr.poll_complete()
             }
             else {
-                Ok(Async::NotReady)
+                Ok(Poll::Pending)
             }
         };
         if let Err(e) = res {
             self.on_disconnect(DisconnectionReason::SendFailed(e));
         }
     }
-    fn poll_stream(&mut self) -> Async<Option<Transmission>> {
+    fn poll_stream(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Transmission>> {
         use self::StreamState::*;
         loop {
             match ::std::mem::replace(&mut self.stream, Failed) {
                 Connected(mut fr) => {
                     match fr.poll() {
-                        Ok(Async::Ready(Some(r))) => {
+                        Ok(Poll::Ready(Some(r))) => {
                             self.stream = Connected(fr);
-                            return Async::Ready(Some(r));
+                            return Poll::Ready(Some(r));
                         },
-                        Ok(Async::Ready(None)) => {
+                        Ok(Poll::Ready(None)) => {
                             self.on_disconnect(DisconnectionReason::ClosedByOtherSide);
-                            return Async::NotReady;
+                            return Poll::Pending;
                         },
-                        Ok(Async::NotReady) => {
+                        Ok(Poll::Pending) => {
                             self.stream = Connected(fr);
-                            return Async::NotReady;
+                            return Poll::Pending;
                         },
                         Err(e) => {
                             self.on_disconnect(DisconnectionReason::RecvFailed(e));
-                            return Async::NotReady;
+                            return Poll::Pending;
                         },
                     }
                 },
                 Connecting(mut tsn) => {
                     match tsn.poll() {
-                        Ok(Async::Ready(s)) => {
+                        Ok(Poll::Ready(s)) => {
                             let fr = s.framed(Codec);
                             self.stream = Connected(fr);
                             self.on_stream_ready();
                         },
-                        Ok(Async::NotReady) => {
+                        Ok(Poll::Pending) => {
                             self.stream = Connecting(tsn);
-                            return Async::NotReady;
+                            return Poll::Pending;
                         },
                         Err(e) => {
                             self.on_disconnect(DisconnectionReason::ConnectFailed(e));
-                            return Async::NotReady;
+                            return Poll::Pending;
                         },
                     }
                 },
                 Failed => {
-                    return Async::NotReady;
+                    return Poll::Pending;
                 },
             }
         }
@@ -419,28 +420,26 @@ pub enum SessionEvent {
 }
 pub(crate) enum StreamState {
     Connected(Framed<TcpStream, Codec>),
-    Connecting(TcpStreamNew),
+    Connecting(TcpStream),
     Failed
 }
 pub struct Session {
     config: SessionConfig,
     pub(crate) state: SessionState,
     stream: StreamState,
-    hdl: Handle,
     events: Vec<SessionEvent>
 }
 impl Stream for Session {
     type Item = SessionEvent;
-    type Error = ::std::io::Error;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Self::Item>>> {
         use frame::Transmission::*;
 
-        while let Async::Ready(Some(val)) = self.poll_stream() {
+        while let Poll::Ready(Some(val)) = self.poll_stream(cx) {
             match val {
                 HeartBeat => {
                     debug!("Received heartbeat.");
-                    self.on_recv_data()?;
+                    self.get_mut().on_recv_data()?;
                 },
                 CompleteFrame(frame) => {
                     debug!("Received frame: {:?}", frame);
@@ -459,18 +458,18 @@ impl Stream for Session {
         let rxh = self.state.rx_heartbeat_timeout
             .as_mut()
             .map(|t| t.poll())
-            .unwrap_or(Ok(Async::NotReady))?;
+            .unwrap_or(Ok(Poll::Pending))?;
 
-        if let Async::Ready(_) = rxh {
+        if let Poll::Ready(_) = rxh {
             self.on_disconnect(DisconnectionReason::HeartbeatTimeout);
         }
 
         let txh = self.state.tx_heartbeat_timeout
             .as_mut()
             .map(|t| t.poll())
-            .unwrap_or(Ok(Async::NotReady))?;
+            .unwrap_or(Ok(Poll::Pending))?;
 
-        if let Async::Ready(_) = txh {
+        if let Poll::Ready(_) = txh {
             self.reply_to_heartbeat()?;
         }
 
@@ -481,10 +480,10 @@ impl Stream for Session {
                 // make sure we get polled again, so we can get rid of our other events
                 task::current().notify();
             }
-            Ok(Async::Ready(Some(self.events.remove(0))))
+            Ok(Poll::Ready(Some(self.events.remove(0))))
         }
         else {
-            Ok(Async::NotReady)
+            Ok(Poll::Pending)
         }
     }
 }
