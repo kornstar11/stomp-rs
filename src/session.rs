@@ -194,7 +194,7 @@ impl Session {
         Ok(())
     }
 
-    fn register_rx_heartbeat_timeout(&mut self) -> Result<()> {
+    fn register_rx_heartbeat_timeout(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<()> {
         use std::time::Duration;
 
         let rx_heartbeat_ms = self.state.rx_heartbeat_ms
@@ -214,9 +214,9 @@ impl Session {
         Ok(())
     }
 
-    fn on_recv_data(&mut self) -> Result<()> {
+    fn on_recv_data(mut self: Pin<&mut Self>, cx: &mut Context<'_>,) -> Result<()> {
         if self.state.rx_heartbeat_ms.is_some() {
-            self.register_rx_heartbeat_timeout()?;
+            self.register_rx_heartbeat_timeout(cx)?;
         }
         Ok(())
     }
@@ -231,7 +231,7 @@ impl Session {
         info!("Disconnected.");
         self.events.push(SessionEvent::Disconnected(reason));
         if let StreamState::Connected(ref mut strm) = self.stream {
-            let _ = strm.get_mut().shutdown(::std::net::Shutdown::Both);
+            let _ = strm.shutdown(::std::net::Shutdown::Both);
         }
         self.stream = StreamState::Failed;
         self.state.tx_heartbeat_timeout = None;
@@ -301,8 +301,8 @@ impl Session {
         self.state.rx_heartbeat_ms = Some((agreed_upon_rx_ms as f32 * GRACE_PERIOD_MULTIPLIER) as u32);
         self.state.tx_heartbeat_ms = Some(agreed_upon_tx_ms);
 
-        self.register_tx_heartbeat_timeout()?;
-        self.register_rx_heartbeat_timeout()?;
+        self.register_tx_heartbeat_timeout(cx)?;
+        self.register_rx_heartbeat_timeout(cx)?;
 
         self.events.push(SessionEvent::Connected);
 
@@ -319,7 +319,7 @@ impl Session {
         };
         if let Some(receipt_id) = receipt_id {
             if receipt_id == "msg/disconnect" {
-                self.on_disconnect(DisconnectionReason::Requested);
+                self.on_disconnect(cx, DisconnectionReason::Requested);
             }
             if let Some(entry) = self.state.outstanding_receipts.remove(&receipt_id) {
                 let original_frame = entry.original_frame;
@@ -335,14 +335,14 @@ impl Session {
     fn poll_stream_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) {
         let res = {
             if let StreamState::Connected(ref mut fr) = self.stream {
-                fr.poll_flush(cx) // https://docs.rs/tokio-io/0.1.2/tokio_io/codec/struct.Framed.html#method.poll_complete
+                Pin::new(fr).poll_flush(cx) // https://docs.rs/tokio-io/0.1.2/tokio_io/codec/struct.Framed.html#method.poll_complete
             }
             else {
-                Ok(Poll::Pending)
+                Poll::Pending
             }
         };
-        if let Err(e) = res {
-            self.on_disconnect(DisconnectionReason::SendFailed(e));
+        if let Poll::Ready(Err(e)) = res {
+            self.on_disconnect(cx, DisconnectionReason::SendFailed(e));
         }
     }
     fn poll_stream(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Transmission>> {
@@ -350,21 +350,21 @@ impl Session {
         loop {
             match ::std::mem::replace(&mut self.stream, Failed) {
                 Connected(mut fr) => {
-                    match fr.poll() {
-                        Ok(Poll::Ready(Some(r))) => {
+                    match Pin::new(&mut fr).poll_next(cx) {
+                        Poll::Ready(Some(Ok(r))) => {
                             self.stream = Connected(fr);
                             return Poll::Ready(Some(r));
                         },
-                        Ok(Poll::Ready(None)) => {
-                            self.on_disconnect(DisconnectionReason::ClosedByOtherSide);
+                        Poll::Ready(None) => {
+                            self.on_disconnect(cx, DisconnectionReason::ClosedByOtherSide);
                             return Poll::Pending;
                         },
-                        Ok(Poll::Pending) => {
+                        Poll::Pending => {
                             self.stream = Connected(fr);
                             return Poll::Pending;
                         },
-                        Err(e) => {
-                            self.on_disconnect(DisconnectionReason::RecvFailed(e));
+                        Poll::Ready(Some(Err(e))) => {
+                            self.on_disconnect(cx, DisconnectionReason::RecvFailed(e));
                             return Poll::Pending;
                         },
                     }
@@ -374,14 +374,14 @@ impl Session {
                         Ok(Poll::Ready(s)) => {
                             let fr = s.framed(Codec);
                             self.stream = Connected(fr);
-                            self.on_stream_ready();
+                            self.on_stream_ready(cx);
                         },
                         Ok(Poll::Pending) => {
                             self.stream = Connecting(tsn);
                             return Poll::Pending;
                         },
                         Err(e) => {
-                            self.on_disconnect(DisconnectionReason::ConnectFailed(e));
+                            self.on_disconnect(cx,DisconnectionReason::ConnectFailed(e));
                             return Poll::Pending;
                         },
                     }
