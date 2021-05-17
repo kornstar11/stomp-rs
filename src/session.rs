@@ -1,15 +1,5 @@
 use std::collections::hash_map::HashMap;
 use std::io::Result;
-use connection::{self, Connection};
-use subscription::{AckMode, AckOrNack, Subscription};
-use frame::{Frame, Command, ToFrameBody};
-use frame::Transmission::{self, HeartBeat, CompleteFrame};
-use header::{self, Header};
-//use transaction::Transaction;
-use session_builder::SessionConfig;
-use message_builder::MessageBuilder;
-use subscription_builder::SubscriptionBuilder;
-use codec::Codec;
 use futures::*;
 use async_net::TcpStream;
 use futures::task::{Poll, Context};
@@ -17,6 +7,15 @@ use std::pin::Pin;
 use smol::Timer;
 use asynchronous_codec::Framed;
 use smol::future::FutureExt;
+use crate::frame::Transmission::{HeartBeat, CompleteFrame};
+use crate::frame::{Frame, Transmission, ToFrameBody, Command};
+use crate::message_builder::MessageBuilder ;
+use crate::subscription_builder::SubscriptionBuilder;
+use crate::connection::Connection;
+use crate::subscription::{Subscription, AckMode, AckOrNack};
+use crate::codec::Codec;
+use crate::session_builder::SessionConfig;
+use crate::header::Header;
 
 const GRACE_PERIOD_MULTIPLIER: f32 = 2.0;
 
@@ -121,7 +120,7 @@ impl Session {
     //     Ok(())
     // }
     pub fn acknowledge_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: &Frame, which: AckOrNack) {
-        if let Some(header::Ack(ack_id)) = frame.headers.get_ack() {
+        if let Some(crate::header::Ack(ack_id)) = frame.headers.get_ack() {
             let ack_frame = if let AckOrNack::Ack = which {
                 Frame::ack(ack_id)
             }
@@ -252,7 +251,7 @@ impl Session {
             None => debug!("No credentials supplied."),
         }
 
-        let connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
+        let crate::connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
         let heart_beat_string = format!("{},{}", client_tx_ms, client_rx_ms);
         debug!("Using heartbeat: {},{}", client_tx_ms, client_rx_ms);
         self.config.headers.push(Header::new("heart-beat", heart_beat_string.as_ref()));
@@ -267,7 +266,7 @@ impl Session {
     }
     fn on_message(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: Frame) {
         let mut sub_data = None;
-        if let Some(header::Subscription(sub_id)) = frame.headers.get_subscription() {
+        if let Some(crate::header::Subscription(sub_id)) = frame.headers.get_subscription() {
             if let Some(ref sub) = self.state.subscriptions.get(sub_id) {
                 sub_data = Some((sub.destination.clone(), sub.ack_mode));
             }
@@ -286,11 +285,11 @@ impl Session {
 
     fn on_connected_frame_received(mut self: Pin<&mut Self>, cx: &mut Context<'_>, connected_frame: Frame) -> Result<()> {
         // The Client's requested tx/rx HeartBeat timeouts
-        let connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
+        let crate::connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
 
         // The timeouts the server is willing to provide
         let (server_tx_ms, server_rx_ms) = match connected_frame.headers.get_heart_beat() {
-            Some(header::HeartBeat(tx_ms, rx_ms)) => (tx_ms, rx_ms),
+            Some(crate::header::HeartBeat(tx_ms, rx_ms)) => (tx_ms, rx_ms),
             None => (0, 0),
         };
 
@@ -310,7 +309,7 @@ impl Session {
     }
     fn handle_receipt(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: Frame) {
         let receipt_id = {
-            if let Some(header::ReceiptId(receipt_id)) = frame.headers.get_receipt_id() {
+            if let Some(crate::header::ReceiptId(receipt_id)) = frame.headers.get_receipt_id() {
                 Some(receipt_id.to_owned())
             }
             else {
@@ -369,9 +368,10 @@ impl Session {
                         },
                     }
                 },
-                Connecting(mut tsn) => {
-                    match Pin::new(&mut tsn).poll_next(cx) {
-                        Poll::Ready(Some(Ok(s))) => {
+                Connecting(tsn) => {
+                    let mut tsn= tsn.boxed();
+                    match Pin::new(&mut tsn).poll(cx) {
+                        Poll::Ready(Ok(s)) => {
                             let fr = s.framed(Codec);
                             self.stream = Connected(fr);
                             self.on_stream_ready(cx);
@@ -380,7 +380,7 @@ impl Session {
                             self.stream = Connecting(tsn);
                             return Poll::Pending;
                         },
-                        Poll::Ready(Some(Err(e))) => {
+                        Poll::Ready(Err(e)) => {
                             self.on_disconnect(cx,DisconnectionReason::ConnectFailed(e));
                             return Poll::Pending;
                         },

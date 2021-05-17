@@ -1,11 +1,11 @@
-use option_setter::OptionSetter;
-use connection::{HeartBeat, OwnedCredentials};
-use header::{HeaderList, Header};
-
 use std::net::ToSocketAddrs;
 use session::Session;
 use std::io;
 use async_net::TcpStream;
+use crate::session::Session;
+use crate::connection::{OwnedCredentials, HeartBeat};
+use crate::header::HeaderList;
+use crate::option_setter::OptionSetter;
 
 #[derive(Clone)]
 pub struct SessionConfig {
@@ -41,11 +41,12 @@ impl SessionBuilder {
     }
 
     #[allow(dead_code)]
-    pub fn start<'b, 'c>(self) -> ::std::io::Result<Session> {
+    pub async fn start<'b, 'c>(self) -> ::std::io::Result<Session> {
         let address = (&self.config.host as &str, self.config.port)
             .to_socket_addrs()?.nth(0)
             .ok_or(io::Error::new(io::ErrorKind::Other, "address provided resolved to nothing"))?;
-        Ok(Session::new(self.config, TcpStream::connect(&address)))
+        let tcp_stream = TcpStream::connect(&address).await?;
+        Ok(Session::new(self.config, tcp_stream))
     }
 
     #[allow(dead_code)]

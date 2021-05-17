@@ -1,6 +1,6 @@
-use session::{Session, ReceiptRequest, OutstandingReceipt};
-use frame::Frame;
-use option_setter::OptionSetter;
+use crate::session::{Session, ReceiptRequest, OutstandingReceipt};
+use crate::frame::Frame;
+use crate::option_setter::OptionSetter;
 
 pub struct MessageBuilder<'a> {
     pub session: &'a mut Session,
