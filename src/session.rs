@@ -370,17 +370,17 @@ impl Session {
                     }
                 },
                 Connecting(mut tsn) => {
-                    match tsn.poll() {
-                        Ok(Poll::Ready(s)) => {
+                    match Pin::new(&mut tsn).poll_next(cx) {
+                        Poll::Ready(Some(Ok(s))) => {
                             let fr = s.framed(Codec);
                             self.stream = Connected(fr);
                             self.on_stream_ready(cx);
                         },
-                        Ok(Poll::Pending) => {
+                        Poll::Pending => {
                             self.stream = Connecting(tsn);
                             return Poll::Pending;
                         },
-                        Err(e) => {
+                        Poll::Ready(Some(Err(e))) => {
                             self.on_disconnect(cx,DisconnectionReason::ConnectFailed(e));
                             return Poll::Pending;
                         },
