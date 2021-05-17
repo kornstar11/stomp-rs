@@ -1,33 +1,33 @@
 use header::{Header, HeaderList};
 use frame::{Frame, Transmission};
-use bytes::BytesMut;
 use frame::Command;
 //use tokio_io::codec::{Encoder, Decoder};
 use nom::{line_ending, anychar};
+use asynchronous_codec::{Encoder, Decoder, BytesMut};
 
-trait Encoder {
-    type Item;
-    type Error: From<std::io::Error>;
-    fn encode(
-        &mut self,
-        item: Self::Item,
-        dst: &mut BytesMut
-    ) -> Result<(), Self::Error>;
-}
-
-pub trait Decoder {
-    type Item;
-    type Error: From<std::io::Error>;
-    fn decode(
-        &mut self,
-        src: &mut BytesMut
-    ) -> Result<Option<Self::Item>, Self::Error>;
-
-    // fn decode_eof(
-    //     &mut self,
-    //     buf: &mut BytesMut
-    // ) -> Result<Option<Self::Item>, Self::Error> {  }
-}
+// trait Encoder {
+//     type Item;
+//     type Error: From<std::io::Error>;
+//     fn encode(
+//         &mut self,
+//         item: Self::Item,
+//         dst: &mut BytesMut
+//     ) -> Result<(), Self::Error>;
+// }
+//
+// pub trait Decoder {
+//     type Item;
+//     type Error: From<std::io::Error>;
+//     fn decode(
+//         &mut self,
+//         src: &mut BytesMut
+//     ) -> Result<Option<Self::Item>, Self::Error>;
+//
+//     // fn decode_eof(
+//     //     &mut self,
+//     //     buf: &mut BytesMut
+//     // ) -> Result<Option<Self::Item>, Self::Error> {  }
+// }
 
 named!(parse_server_command(&[u8]) -> Command,
        alt!(

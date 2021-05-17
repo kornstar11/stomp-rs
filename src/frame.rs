@@ -4,7 +4,7 @@ use subscription::AckMode;
 use std::str::from_utf8;
 use std::fmt;
 use std::fmt::Formatter;
-use bytes::BytesMut;
+use asynchronous_codec::BytesMut;
 
 #[derive(Copy, Clone, Debug)]
 pub enum Command {

@@ -10,6 +10,7 @@ extern crate bytes;
 extern crate nom;
 extern crate async_net;
 extern crate smol;
+extern crate asynchronous_codec;
 
 pub mod connection;
 pub mod header;

@@ -5,17 +5,18 @@ use subscription::{AckMode, AckOrNack, Subscription};
 use frame::{Frame, Command, ToFrameBody};
 use frame::Transmission::{self, HeartBeat, CompleteFrame};
 use header::{self, Header};
-use transaction::Transaction;
+//use transaction::Transaction;
 use session_builder::SessionConfig;
 use message_builder::MessageBuilder;
 use subscription_builder::SubscriptionBuilder;
-//use tokio_io::codec::Framed;
 use codec::Codec;
 use futures::*;
 use async_net::TcpStream;
 use futures::task::{Poll, Context};
 use std::pin::Pin;
 use smol::Timer;
+use asynchronous_codec::Framed;
+use smol::future::FutureExt;
 
 const GRACE_PERIOD_MULTIPLIER: f32 = 2.0;
 
@@ -73,8 +74,8 @@ impl SessionState {
 
 // *** Public API ***
 impl Session {
-    pub fn send_frame(&mut self, fr: Frame) {
-        self.send(Transmission::CompleteFrame(fr))
+    pub fn send_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>, fr: Frame) {
+        self.send(cx, Transmission::CompleteFrame(fr))
     }
     pub fn message<'builder, T: ToFrameBody>(&'builder mut self,
                                              destination: &str,
@@ -91,35 +92,35 @@ impl Session {
         SubscriptionBuilder::new(self, destination.to_owned())
     }
 
-    pub fn begin_transaction<'b>(&'b mut self) -> Transaction<'b> {
-        let mut transaction = Transaction::new(self);
-        let _ = transaction.begin();
-        transaction
-    }
+    // pub fn begin_transaction<'b>(&'b mut self) -> Transaction<'b> {
+    //     let mut transaction = Transaction::new(self);
+    //     let _ = transaction.begin();
+    //     transaction
+    // }
 
-    pub fn unsubscribe(&mut self, sub_id: &str) {
+    pub fn unsubscribe(mut self: Pin<&mut Self>, cx: &mut Context<'_>, sub_id: &str) {
         self.state.subscriptions.remove(sub_id);
         let unsubscribe_frame = Frame::unsubscribe(sub_id.as_ref());
-        self.send(CompleteFrame(unsubscribe_frame))
+        self.send(cx, CompleteFrame(unsubscribe_frame))
     }
 
-    pub fn disconnect(&mut self) {
-        self.send_frame(Frame::disconnect());
+    pub fn disconnect(mut self: Pin<&mut Self>, cx: &mut Context<'_>) {
+        self.send_frame(cx, Frame::disconnect());
     }
-    pub fn reconnect(&mut self) -> ::std::io::Result<()> {
-        use std::net::ToSocketAddrs;
-        use std::io;
-
-        info!("Reconnecting...");
-
-        let address = (&self.config.host as &str, self.config.port)
-            .to_socket_addrs()?.nth(0)
-            .ok_or(io::Error::new(io::ErrorKind::Other, "address provided resolved to nothing"))?;
-        self.stream = StreamState::Connecting(TcpStream::connect(&address));
-        task::current().notify();
-        Ok(())
-    }
-    pub fn acknowledge_frame(&mut self, frame: &Frame, which: AckOrNack) {
+    // pub fn reconnect(&mut self) -> ::std::io::Result<()> {
+    //     use std::net::ToSocketAddrs;
+    //     use std::io;
+    //
+    //     info!("Reconnecting...");
+    //
+    //     let address = (&self.config.host as &str, self.config.port)
+    //         .to_socket_addrs()?.nth(0)
+    //         .ok_or(io::Error::new(io::ErrorKind::Other, "address provided resolved to nothing"))?;
+    //     self.stream = StreamState::Connecting(TcpStream::connect(&address));
+    //     task::current().notify();
+    //     Ok(())
+    // }
+    pub fn acknowledge_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: &Frame, which: AckOrNack) {
         if let Some(header::Ack(ack_id)) = frame.headers.get_ack() {
             let ack_frame = if let AckOrNack::Ack = which {
                 Frame::ack(ack_id)
@@ -127,13 +128,13 @@ impl Session {
             else {
                 Frame::nack(ack_id)
             };
-            self.send_frame(ack_frame);
+            self.send_frame(cx, ack_frame);
         }
     }
 }
 // *** pub(crate) API ***
 impl Session {
-    pub(crate) fn new(config: SessionConfig, stream: TcpStreamNew) -> Self {
+    pub(crate) fn new(config: SessionConfig, stream: TcpStream) -> Self {
         Self {
             config,
             state: SessionState::new(),
@@ -161,22 +162,22 @@ impl Session {
 }
 // *** Internal API ***
 impl Session {
-    fn _send(&mut self, tx: Transmission) -> Result<()> {
+    fn _send(mut self: Pin<&mut Self>, cx: &mut Context<'_>, tx: Transmission) -> Result<()> {
         if let StreamState::Connected(ref mut st) = self.stream {
-            st.start_send(tx)?;
-            st.poll_complete()?;
+            Pin::new(st).start_send(tx)?;
+            Pin::new(st).poll_flush(cx)?;
         }
         else {
             warn!("sending {:?} whilst disconnected", tx);
         }
         Ok(())
     }
-    fn send(&mut self, tx: Transmission) {
-        if let Err(e) = self._send(tx) {
-            self.on_disconnect(DisconnectionReason::SendFailed(e));
+    fn send(mut self: Pin<&mut Self>, cx: &mut Context<'_>, tx: Transmission) {
+        if let Err(e) = self._send(cx, tx) {
+            self.on_disconnect(cx, DisconnectionReason::SendFailed(e));
         }
     }
-    fn register_tx_heartbeat_timeout(&mut self) -> Result<()> {
+    fn register_tx_heartbeat_timeout(mut self: Pin<&mut Self>, cx: &mut Context<'_>,) -> Result<()> {
         use std::time::Duration;
         if self.state.tx_heartbeat_ms.is_none() {
             warn!("Trying to register TX heartbeat timeout, but not set!");
@@ -220,13 +221,13 @@ impl Session {
         Ok(())
     }
 
-    fn reply_to_heartbeat(&mut self) -> Result<()> {
+    fn reply_to_heartbeat(mut self: Pin<&mut Self>, cx: &mut Context<'_>,) -> Result<()> {
         debug!("Sending heartbeat");
-        self.send(HeartBeat);
-        self.register_tx_heartbeat_timeout()?;
+        self.send(cx, HeartBeat);
+        self.register_tx_heartbeat_timeout(cx)?;
         Ok(())
     }
-    fn on_disconnect(&mut self, reason: DisconnectionReason) {
+    fn on_disconnect(mut self: Pin<&mut Self>, cx: &mut Context<'_>, reason: DisconnectionReason) {
         info!("Disconnected.");
         self.events.push(SessionEvent::Disconnected(reason));
         if let StreamState::Connected(ref mut strm) = self.stream {
@@ -236,7 +237,7 @@ impl Session {
         self.state.tx_heartbeat_timeout = None;
         self.state.rx_heartbeat_timeout = None;
     }
-    fn on_stream_ready(&mut self) {
+    fn on_stream_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>,) {
         debug!("Stream ready!");
         // Add credentials to the header list if specified
         match self.config.credentials.clone() { // TODO: Refactor to avoid clone
@@ -262,9 +263,9 @@ impl Session {
             body: Vec::new(),
         };
 
-        self.send_frame(connect_frame);
+        self.send_frame(cx, connect_frame);
     }
-    fn on_message(&mut self, frame: Frame) {
+    fn on_message(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: Frame) {
         let mut sub_data = None;
         if let Some(header::Subscription(sub_id)) = frame.headers.get_subscription() {
             if let Some(ref sub) = self.state.subscriptions.get(sub_id) {
@@ -283,7 +284,7 @@ impl Session {
         }
     }
 
-    fn on_connected_frame_received(&mut self, connected_frame: Frame) -> Result<()> {
+    fn on_connected_frame_received(mut self: Pin<&mut Self>, cx: &mut Context<'_>, connected_frame: Frame) -> Result<()> {
         // The Client's requested tx/rx HeartBeat timeouts
         let connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
 
@@ -307,7 +308,7 @@ impl Session {
 
         Ok(())
     }
-    fn handle_receipt(&mut self, frame: Frame) {
+    fn handle_receipt(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: Frame) {
         let receipt_id = {
             if let Some(header::ReceiptId(receipt_id)) = frame.headers.get_receipt_id() {
                 Some(receipt_id.to_owned())
@@ -331,10 +332,10 @@ impl Session {
         }
     }
 
-    fn poll_stream_complete(&mut self) {
+    fn poll_stream_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) {
         let res = {
             if let StreamState::Connected(ref mut fr) = self.stream {
-                fr.poll_complete()
+                fr.poll_flush(cx) // https://docs.rs/tokio-io/0.1.2/tokio_io/codec/struct.Framed.html#method.poll_complete
             }
             else {
                 Ok(Poll::Pending)
@@ -430,9 +431,10 @@ pub struct Session {
     events: Vec<SessionEvent>
 }
 impl Stream for Session {
-    type Item = SessionEvent;
+    type Item = Result<SessionEvent>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Self::Item>>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        /*
         use frame::Transmission::*;
 
         while let Poll::Ready(Some(val)) = self.poll_stream(cx) {
@@ -485,5 +487,7 @@ impl Stream for Session {
         else {
             Ok(Poll::Pending)
         }
+         */
+        Poll::Pending
     }
 }
