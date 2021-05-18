@@ -215,7 +215,7 @@ impl Session {
         Ok(())
     }
 
-    async fn on_recv_data(&mut self) -> Result<()> {
+    fn on_recv_data(&mut self) -> Result<()> {
         if self.state.rx_heartbeat_ms.is_some() {
             self.register_rx_heartbeat_timeout()?;
         }
@@ -287,7 +287,7 @@ impl Session {
         }
     }
 
-    async fn on_connected_frame_received(&mut self, connected_frame: Frame) -> Result<()> {
+    fn on_connected_frame_received(&mut self, connected_frame: Frame) -> Result<()> {
         // The Client's requested tx/rx HeartBeat timeouts
         let crate::connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
 
@@ -350,30 +350,83 @@ impl Session {
     }
     async fn poll_stream(&mut self) -> Result<Option<Transmission>> {
         use self::StreamState::*;
-        loop {
-            match ::std::mem::replace(&mut self.stream, Failed) {
-                Connected(mut fr) => {
-                    match fr.next().await {
-                        Some(Ok(r)) => {
-                            self.stream = Connected(fr);
-                            return Ok(Some(r));
-                        },
-                        None => {
-                            self.on_disconnect(DisconnectionReason::ClosedByOtherSide);
-                            return Ok(None);
-                        },
-                        Some(Err(e)) => {
-                            let ret = Err(std::io::Error::from(e.kind()));
-                            self.on_disconnect(DisconnectionReason::RecvFailed(e));
-                            return ret;
-                        },
+        match ::std::mem::replace(&mut self.stream, Failed) {
+            Connected(mut fr) => {
+                match fr.next().await {
+                    Some(Ok(r)) => {
+                        self.stream = Connected(fr);
+                        return Ok(Some(r));
+                    },
+                    None => {
+                        self.on_disconnect(DisconnectionReason::ClosedByOtherSide);
+                        return Ok(None);
+                    },
+                    Some(Err(e)) => {
+                        let ret = Err(std::io::Error::from(e.kind()));
+                        self.on_disconnect(DisconnectionReason::RecvFailed(e));
+                        return ret;
+                    },
+                }
+            },
+            Failed => {
+                return Err(std::io::Error::new(ErrorKind::BrokenPipe, std::io::Error::from(ErrorKind::BrokenPipe)));
+            },
+        }
+    }
+
+    async fn run_stream(&mut self) -> Option<Result<SessionEvent>> {
+        use crate::frame::Transmission::*;
+
+        match self.poll_stream().await {
+            Ok(Some(val)) => {
+                match val {
+                    HeartBeat => {
+                        debug!("Received heartbeat.");
+                        self.on_recv_data()?;
+                    },
+                    CompleteFrame(frame) => {
+                        debug!("Received frame: {:?}", frame);
+                        self.on_recv_data()?;
+                        match frame.command {
+                            Command::Error => self.events.push(SessionEvent::ErrorFrame(frame)),
+                            Command::Receipt => self.handle_receipt(frame),
+                            Command::Connected => self.on_connected_frame_received(frame)?,
+                            Command::Message => self.on_message(frame),
+                            _ => self.events.push(SessionEvent::UnknownFrame(frame))
+                        };
                     }
-                },
-                Failed => {
-                    return Err(std::io::Error::new(ErrorKind::BrokenPipe, std::io::Error::from(ErrorKind::BrokenPipe)));
-                },
+                }
+
+                let rxh = self.state.rx_heartbeat_timeout
+                    .as_mut()
+                    .map(|t| poll!(t))
+                    .unwrap_or(Poll::Pending);
+
+                if let Poll::Ready(_) = rxh {
+                    self.on_disconnect(DisconnectionReason::HeartbeatTimeout);
+                }
+
+                let txh = self.state.tx_heartbeat_timeout
+                    .as_mut()
+                    .map(|t| poll!(t))
+                    .unwrap_or(Poll::Pending);
+
+                if let Poll::Ready(_) = txh {
+                    self.reply_to_heartbeat().await?;
+                }
+
+                self.poll_stream_complete().await;
+
+                if self.events.len() > 0 {
+                    Poll::Ready(Ok(Some(self.events.remove(0))))
+                } else {
+                    Poll::Pending
+                }
             }
         }
+
+
+
     }
 }
 #[derive(Debug)]
@@ -413,64 +466,12 @@ pub struct Session {
     stream: StreamState,
     events: Vec<SessionEvent>
 }
+
+
 impl Stream for Session {
     type Item = Result<SessionEvent>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        /*
-        use frame::Transmission::*;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 
-        while let Poll::Ready(Some(val)) = self.poll_stream(cx) {
-            match val {
-                HeartBeat => {
-                    debug!("Received heartbeat.");
-                    self.get_mut().on_recv_data()?;
-                },
-                CompleteFrame(frame) => {
-                    debug!("Received frame: {:?}", frame);
-                    self.on_recv_data()?;
-                    match frame.command {
-                        Command::Error => self.events.push(SessionEvent::ErrorFrame(frame)),
-                        Command::Receipt => self.handle_receipt(frame),
-                        Command::Connected => self.on_connected_frame_received(frame)?,
-                        Command::Message => self.on_message(frame),
-                        _ => self.events.push(SessionEvent::UnknownFrame(frame))
-                    };
-                }
-            }
-        }
-
-        let rxh = self.state.rx_heartbeat_timeout
-            .as_mut()
-            .map(|t| t.poll())
-            .unwrap_or(Ok(Poll::Pending))?;
-
-        if let Poll::Ready(_) = rxh {
-            self.on_disconnect(DisconnectionReason::HeartbeatTimeout);
-        }
-
-        let txh = self.state.tx_heartbeat_timeout
-            .as_mut()
-            .map(|t| t.poll())
-            .unwrap_or(Ok(Poll::Pending))?;
-
-        if let Poll::Ready(_) = txh {
-            self.reply_to_heartbeat()?;
-        }
-
-        self.poll_stream_complete();
-
-        if self.events.len() > 0 {
-            if self.events.len() > 1 {
-                // make sure we get polled again, so we can get rid of our other events
-                task::current().notify();
-            }
-            Ok(Poll::Ready(Some(self.events.remove(0))))
-        }
-        else {
-            Ok(Poll::Pending)
-        }
-         */
-        Poll::Pending
     }
 }
