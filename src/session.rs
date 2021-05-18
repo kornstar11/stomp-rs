@@ -7,6 +7,7 @@ use std::pin::Pin;
 use smol::Timer;
 use asynchronous_codec::Framed;
 use futures::future::FutureExt;
+use futures::future::Future;
 use futures::sink::SinkExt;
 use crate::frame::Transmission::{HeartBeat, CompleteFrame};
 use crate::frame::{Frame, Transmission, ToFrameBody, Command};
@@ -140,7 +141,7 @@ impl Session {
         Self {
             config,
             state: SessionState::new(),
-            events: vec![],
+            //events: vec![],
             stream: StreamState::Connected(stream)
         }
     }
@@ -230,8 +231,8 @@ impl Session {
     }
 
     fn on_disconnect(&mut self, reason: DisconnectionReason) {
-        info!("Disconnected.");
-        self.events.push(SessionEvent::Disconnected(reason));
+        info!("Disconnected. Reason: {:?}", reason);
+        //self.events.push(SessionEvent::Disconnected(reason));
         if let StreamState::Connected(ref mut strm) = self.stream {
             let _ = strm.shutdown(::std::net::Shutdown::Both); //TODO handle result?
         }
@@ -268,7 +269,7 @@ impl Session {
 
         self.send_frame(connect_frame).await;
     }
-    fn on_message(&mut self, frame: Frame) {
+    fn on_message(&mut self, frame: Frame) -> SessionEvent {
         let mut sub_data = None;
         if let Some(crate::header::Subscription(sub_id)) = frame.headers.get_subscription() {
             if let Some(ref sub) = self.state.subscriptions.get(sub_id) {
@@ -276,18 +277,18 @@ impl Session {
             }
         }
         if let Some((destination, ack_mode)) = sub_data {
-            self.events.push(SessionEvent::Message {
+            SessionEvent::Message {
                 destination,
                 ack_mode,
                 frame
-            });
+            }
         }
         else {
-            self.events.push(SessionEvent::SubscriptionlessFrame(frame));
+            SessionEvent::SubscriptionlessFrame(frame)
         }
     }
 
-    fn on_connected_frame_received(&mut self, connected_frame: Frame) -> Result<()> {
+    fn on_connected_frame_received(&mut self, connected_frame: Frame) -> Result<SessionEvent> {
         // The Client's requested tx/rx HeartBeat timeouts
         let crate::connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
 
@@ -307,11 +308,10 @@ impl Session {
         self.register_tx_heartbeat_timeout()?;
         self.register_rx_heartbeat_timeout()?;
 
-        self.events.push(SessionEvent::Connected);
 
-        Ok(())
+        Ok(SessionEvent::Connected)
     }
-    fn handle_receipt(&mut self, frame: Frame) {
+    fn handle_receipt(&mut self, frame: Frame) -> Option<SessionEvent> {
         let receipt_id = {
             if let Some(crate::header::ReceiptId(receipt_id)) = frame.headers.get_receipt_id() {
                 Some(receipt_id.to_owned())
@@ -326,13 +326,15 @@ impl Session {
             }
             if let Some(entry) = self.state.outstanding_receipts.remove(&receipt_id) {
                 let original_frame = entry.original_frame;
-                self.events.push(SessionEvent::Receipt {
+                return Some(SessionEvent::Receipt {
                     id: receipt_id,
                     original: original_frame,
                     receipt: frame
                 });
             }
         }
+
+        None
     }
 
     async fn poll_stream_complete(&mut self) {
@@ -374,59 +376,54 @@ impl Session {
         }
     }
 
-    async fn run_stream(&mut self) -> Option<Result<SessionEvent>> {
+    async fn run_stream(&mut self) -> Result<Option<SessionEvent>> {
         use crate::frame::Transmission::*;
 
         match self.poll_stream().await {
             Ok(Some(val)) => {
-                match val {
+                let event = match val {
                     HeartBeat => {
                         debug!("Received heartbeat.");
                         self.on_recv_data()?;
+                        None
                     },
                     CompleteFrame(frame) => {
                         debug!("Received frame: {:?}", frame);
                         self.on_recv_data()?;
                         match frame.command {
-                            Command::Error => self.events.push(SessionEvent::ErrorFrame(frame)),
+                            Command::Error => Some(SessionEvent::ErrorFrame(frame)),
                             Command::Receipt => self.handle_receipt(frame),
-                            Command::Connected => self.on_connected_frame_received(frame)?,
-                            Command::Message => self.on_message(frame),
-                            _ => self.events.push(SessionEvent::UnknownFrame(frame))
-                        };
+                            Command::Connected => Some(self.on_connected_frame_received(frame)?),
+                            Command::Message => Some(self.on_message(frame)),
+                            _ => Some(SessionEvent::UnknownFrame(frame))
+                        }
+                    }
+                };
+
+                if let Some(ref mut timer) = self.state.rx_heartbeat_timeout {
+                    if let Poll::Ready(_) = poll!(timer) {
+                        self.on_disconnect(DisconnectionReason::HeartbeatTimeout);
                     }
                 }
 
-                let rxh = self.state.rx_heartbeat_timeout
-                    .as_mut()
-                    .map(|t| poll!(t))
-                    .unwrap_or(Poll::Pending);
-
-                if let Poll::Ready(_) = rxh {
-                    self.on_disconnect(DisconnectionReason::HeartbeatTimeout);
-                }
-
-                let txh = self.state.tx_heartbeat_timeout
-                    .as_mut()
-                    .map(|t| poll!(t))
-                    .unwrap_or(Poll::Pending);
-
-                if let Poll::Ready(_) = txh {
-                    self.reply_to_heartbeat().await?;
+                if let Some(ref mut timer) = self.state.tx_heartbeat_timeout {
+                    if let Poll::Ready(_) = poll!(timer) {
+                        self.reply_to_heartbeat().await?;
+                    }
                 }
 
                 self.poll_stream_complete().await;
 
-                if self.events.len() > 0 {
-                    Poll::Ready(Ok(Some(self.events.remove(0))))
-                } else {
-                    Poll::Pending
-                }
+
+                return Ok(event);
+            },
+            Ok(None) => {
+                return Ok(None);
+            },
+            Err(e) => {
+                return Err(std::io::Error::from(e.kind()))
             }
         }
-
-
-
     }
 }
 #[derive(Debug)]
@@ -457,14 +454,12 @@ pub enum SessionEvent {
 }
 pub(crate) enum StreamState {
     Connected(Framed<TcpStream, Codec>),
-    //Connecting(TcpStream),
     Failed
 }
 pub struct Session {
     config: SessionConfig,
     pub(crate) state: SessionState,
     stream: StreamState,
-    events: Vec<SessionEvent>
 }
 
 
@@ -472,6 +467,14 @@ impl Stream for Session {
     type Item = Result<SessionEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-
+        let mut boxed = self.run_stream().boxed();
+        match Pin::new(&mut boxed).poll(cx) {
+            Poll::Pending => {
+                return Poll::Pending;
+            },
+            Poll::Ready(res_opt) => {
+                Poll::Ready(None)
+            }
+        }
     }
 }
