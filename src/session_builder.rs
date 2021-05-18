@@ -1,11 +1,12 @@
 use std::net::ToSocketAddrs;
-use session::Session;
 use std::io;
 use async_net::TcpStream;
 use crate::session::Session;
 use crate::connection::{OwnedCredentials, HeartBeat};
 use crate::header::HeaderList;
 use crate::option_setter::OptionSetter;
+use asynchronous_codec::Framed;
+use crate::codec::Codec;
 
 #[derive(Clone)]
 pub struct SessionConfig {
@@ -46,6 +47,7 @@ impl SessionBuilder {
             .to_socket_addrs()?.nth(0)
             .ok_or(io::Error::new(io::ErrorKind::Other, "address provided resolved to nothing"))?;
         let tcp_stream = TcpStream::connect(&address).await?;
+        let tcp_stream = Framed::new(tcp_stream, Codec);
         Ok(Session::new(self.config, tcp_stream))
     }
 

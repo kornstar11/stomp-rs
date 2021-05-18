@@ -1,12 +1,13 @@
 use std::collections::hash_map::HashMap;
-use std::io::Result;
+use std::io::{Result, ErrorKind};
 use futures::*;
 use async_net::TcpStream;
 use futures::task::{Poll, Context};
 use std::pin::Pin;
 use smol::Timer;
 use asynchronous_codec::Framed;
-use smol::future::FutureExt;
+use futures::future::FutureExt;
+use futures::sink::SinkExt;
 use crate::frame::Transmission::{HeartBeat, CompleteFrame};
 use crate::frame::{Frame, Transmission, ToFrameBody, Command};
 use crate::message_builder::MessageBuilder ;
@@ -16,6 +17,8 @@ use crate::subscription::{Subscription, AckMode, AckOrNack};
 use crate::codec::Codec;
 use crate::session_builder::SessionConfig;
 use crate::header::Header;
+use smol::stream::StreamExt;
+
 
 const GRACE_PERIOD_MULTIPLIER: f32 = 2.0;
 
@@ -73,8 +76,8 @@ impl SessionState {
 
 // *** Public API ***
 impl Session {
-    pub fn send_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>, fr: Frame) {
-        self.send(cx, Transmission::CompleteFrame(fr))
+    pub async fn send_frame(&mut self, fr: Frame) {
+        self.send(Transmission::CompleteFrame(fr)).await
     }
     pub fn message<'builder, T: ToFrameBody>(&'builder mut self,
                                              destination: &str,
@@ -97,14 +100,14 @@ impl Session {
     //     transaction
     // }
 
-    pub fn unsubscribe(mut self: Pin<&mut Self>, cx: &mut Context<'_>, sub_id: &str) {
+    pub async fn unsubscribe(&mut self, sub_id: &str) {
         self.state.subscriptions.remove(sub_id);
         let unsubscribe_frame = Frame::unsubscribe(sub_id.as_ref());
-        self.send(cx, CompleteFrame(unsubscribe_frame))
+        self.send(CompleteFrame(unsubscribe_frame)).await
     }
 
-    pub fn disconnect(mut self: Pin<&mut Self>, cx: &mut Context<'_>) {
-        self.send_frame(cx, Frame::disconnect());
+    pub async fn disconnect(&mut self) {
+        self.send_frame(Frame::disconnect()).await;
     }
     // pub fn reconnect(&mut self) -> ::std::io::Result<()> {
     //     use std::net::ToSocketAddrs;
@@ -119,7 +122,7 @@ impl Session {
     //     task::current().notify();
     //     Ok(())
     // }
-    pub fn acknowledge_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: &Frame, which: AckOrNack) {
+    pub async fn acknowledge_frame(&mut self, frame: &Frame, which: AckOrNack) {
         if let Some(crate::header::Ack(ack_id)) = frame.headers.get_ack() {
             let ack_frame = if let AckOrNack::Ack = which {
                 Frame::ack(ack_id)
@@ -127,18 +130,18 @@ impl Session {
             else {
                 Frame::nack(ack_id)
             };
-            self.send_frame(cx, ack_frame);
+            self.send_frame(ack_frame).await;
         }
     }
 }
 // *** pub(crate) API ***
 impl Session {
-    pub(crate) fn new(config: SessionConfig, stream: TcpStream) -> Self {
+    pub(crate) fn new(config: SessionConfig, stream: Framed<TcpStream, Codec>) -> Self {
         Self {
             config,
             state: SessionState::new(),
             events: vec![],
-            stream: StreamState::Connecting(stream)
+            stream: StreamState::Connected(stream)
         }
     }
     pub(crate) fn generate_transaction_id(&mut self) -> u32 {
@@ -161,28 +164,27 @@ impl Session {
 }
 // *** Internal API ***
 impl Session {
-    fn _send(mut self: Pin<&mut Self>, cx: &mut Context<'_>, tx: Transmission) -> Result<()> {
+    async fn _send(&mut self, tx: Transmission) -> Result<()> {
         if let StreamState::Connected(ref mut st) = self.stream {
-            Pin::new(st).start_send(tx)?;
-            Pin::new(st).poll_flush(cx)?;
+            st.send(tx).await?;
         }
         else {
             warn!("sending {:?} whilst disconnected", tx);
         }
         Ok(())
     }
-    fn send(mut self: Pin<&mut Self>, cx: &mut Context<'_>, tx: Transmission) {
-        if let Err(e) = self._send(cx, tx) {
-            self.on_disconnect(cx, DisconnectionReason::SendFailed(e));
+    async fn send(&mut self, tx: Transmission) {
+        if let Err(e) = self._send(tx).await {
+            self.on_disconnect(DisconnectionReason::SendFailed(e));
         }
     }
-    fn register_tx_heartbeat_timeout(mut self: Pin<&mut Self>, cx: &mut Context<'_>,) -> Result<()> {
+    fn register_tx_heartbeat_timeout(&mut self) -> Result<()> {
         use std::time::Duration;
         if self.state.tx_heartbeat_ms.is_none() {
             warn!("Trying to register TX heartbeat timeout, but not set!");
             return Ok(());
         }
-        let tx_heartbeat_ms = self.state.tx_heartbeat_ms.unwrap();
+        let tx_heartbeat_ms = self.state.tx_heartbeat_ms.unwrap(); //TODO return result
         if tx_heartbeat_ms <= 0 {
             debug!("Heartbeat transmission ms is {}, no need to register a callback.",
                    tx_heartbeat_ms);
@@ -193,7 +195,7 @@ impl Session {
         Ok(())
     }
 
-    fn register_rx_heartbeat_timeout(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<()> {
+    fn register_rx_heartbeat_timeout(&mut self) -> Result<()> {
         use std::time::Duration;
 
         let rx_heartbeat_ms = self.state.rx_heartbeat_ms
@@ -213,30 +215,32 @@ impl Session {
         Ok(())
     }
 
-    fn on_recv_data(mut self: Pin<&mut Self>, cx: &mut Context<'_>,) -> Result<()> {
+    async fn on_recv_data(&mut self) -> Result<()> {
         if self.state.rx_heartbeat_ms.is_some() {
-            self.register_rx_heartbeat_timeout(cx)?;
+            self.register_rx_heartbeat_timeout()?;
         }
         Ok(())
     }
 
-    fn reply_to_heartbeat(mut self: Pin<&mut Self>, cx: &mut Context<'_>,) -> Result<()> {
+    async fn reply_to_heartbeat(&mut self) -> Result<()> {
         debug!("Sending heartbeat");
-        self.send(cx, HeartBeat);
-        self.register_tx_heartbeat_timeout(cx)?;
+        self.send(HeartBeat).await;
+        self.register_tx_heartbeat_timeout()?;
         Ok(())
     }
-    fn on_disconnect(mut self: Pin<&mut Self>, cx: &mut Context<'_>, reason: DisconnectionReason) {
+
+    fn on_disconnect(&mut self, reason: DisconnectionReason) {
         info!("Disconnected.");
         self.events.push(SessionEvent::Disconnected(reason));
         if let StreamState::Connected(ref mut strm) = self.stream {
-            let _ = strm.shutdown(::std::net::Shutdown::Both);
+            let _ = strm.shutdown(::std::net::Shutdown::Both); //TODO handle result?
         }
         self.stream = StreamState::Failed;
         self.state.tx_heartbeat_timeout = None;
         self.state.rx_heartbeat_timeout = None;
     }
-    fn on_stream_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>,) {
+
+    async fn on_stream_ready(&mut self) {
         debug!("Stream ready!");
         // Add credentials to the header list if specified
         match self.config.credentials.clone() { // TODO: Refactor to avoid clone
@@ -262,9 +266,9 @@ impl Session {
             body: Vec::new(),
         };
 
-        self.send_frame(cx, connect_frame);
+        self.send_frame(connect_frame).await;
     }
-    fn on_message(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: Frame) {
+    fn on_message(&mut self, frame: Frame) {
         let mut sub_data = None;
         if let Some(crate::header::Subscription(sub_id)) = frame.headers.get_subscription() {
             if let Some(ref sub) = self.state.subscriptions.get(sub_id) {
@@ -283,7 +287,7 @@ impl Session {
         }
     }
 
-    fn on_connected_frame_received(mut self: Pin<&mut Self>, cx: &mut Context<'_>, connected_frame: Frame) -> Result<()> {
+    async fn on_connected_frame_received(&mut self, connected_frame: Frame) -> Result<()> {
         // The Client's requested tx/rx HeartBeat timeouts
         let crate::connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
 
@@ -300,14 +304,14 @@ impl Session {
         self.state.rx_heartbeat_ms = Some((agreed_upon_rx_ms as f32 * GRACE_PERIOD_MULTIPLIER) as u32);
         self.state.tx_heartbeat_ms = Some(agreed_upon_tx_ms);
 
-        self.register_tx_heartbeat_timeout(cx)?;
-        self.register_rx_heartbeat_timeout(cx)?;
+        self.register_tx_heartbeat_timeout()?;
+        self.register_rx_heartbeat_timeout()?;
 
         self.events.push(SessionEvent::Connected);
 
         Ok(())
     }
-    fn handle_receipt(mut self: Pin<&mut Self>, cx: &mut Context<'_>, frame: Frame) {
+    fn handle_receipt(&mut self, frame: Frame) {
         let receipt_id = {
             if let Some(crate::header::ReceiptId(receipt_id)) = frame.headers.get_receipt_id() {
                 Some(receipt_id.to_owned())
@@ -318,7 +322,7 @@ impl Session {
         };
         if let Some(receipt_id) = receipt_id {
             if receipt_id == "msg/disconnect" {
-                self.on_disconnect(cx, DisconnectionReason::Requested);
+                self.on_disconnect(DisconnectionReason::Requested);
             }
             if let Some(entry) = self.state.outstanding_receipts.remove(&receipt_id) {
                 let original_frame = entry.original_frame;
@@ -331,63 +335,42 @@ impl Session {
         }
     }
 
-    fn poll_stream_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) {
+    async fn poll_stream_complete(&mut self) {
         let res = {
             if let StreamState::Connected(ref mut fr) = self.stream {
-                Pin::new(fr).poll_flush(cx) // https://docs.rs/tokio-io/0.1.2/tokio_io/codec/struct.Framed.html#method.poll_complete
+                fr.flush().await // https://docs.rs/tokio-io/0.1.2/tokio_io/codec/struct.Framed.html#method.poll_complete
             }
             else {
-                Poll::Pending
+                Err(std::io::Error::new(ErrorKind::NotConnected, std::io::Error::from(ErrorKind::NotConnected)))
             }
         };
-        if let Poll::Ready(Err(e)) = res {
-            self.on_disconnect(cx, DisconnectionReason::SendFailed(e));
+        if let Err(e) = res {
+            self.on_disconnect(DisconnectionReason::SendFailed(e));
         }
     }
-    fn poll_stream(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Transmission>> {
+    async fn poll_stream(&mut self) -> Result<Option<Transmission>> {
         use self::StreamState::*;
         loop {
             match ::std::mem::replace(&mut self.stream, Failed) {
                 Connected(mut fr) => {
-                    match Pin::new(&mut fr).poll_next(cx) {
-                        Poll::Ready(Some(Ok(r))) => {
+                    match fr.next().await {
+                        Some(Ok(r)) => {
                             self.stream = Connected(fr);
-                            return Poll::Ready(Some(r));
+                            return Ok(Some(r));
                         },
-                        Poll::Ready(None) => {
-                            self.on_disconnect(cx, DisconnectionReason::ClosedByOtherSide);
-                            return Poll::Pending;
+                        None => {
+                            self.on_disconnect(DisconnectionReason::ClosedByOtherSide);
+                            return Ok(None);
                         },
-                        Poll::Pending => {
-                            self.stream = Connected(fr);
-                            return Poll::Pending;
-                        },
-                        Poll::Ready(Some(Err(e))) => {
-                            self.on_disconnect(cx, DisconnectionReason::RecvFailed(e));
-                            return Poll::Pending;
-                        },
-                    }
-                },
-                Connecting(tsn) => {
-                    let mut tsn= tsn.boxed();
-                    match Pin::new(&mut tsn).poll(cx) {
-                        Poll::Ready(Ok(s)) => {
-                            let fr = s.framed(Codec);
-                            self.stream = Connected(fr);
-                            self.on_stream_ready(cx);
-                        },
-                        Poll::Pending => {
-                            self.stream = Connecting(tsn);
-                            return Poll::Pending;
-                        },
-                        Poll::Ready(Err(e)) => {
-                            self.on_disconnect(cx,DisconnectionReason::ConnectFailed(e));
-                            return Poll::Pending;
+                        Some(Err(e)) => {
+                            let ret = Err(std::io::Error::from(e.kind()));
+                            self.on_disconnect(DisconnectionReason::RecvFailed(e));
+                            return ret;
                         },
                     }
                 },
                 Failed => {
-                    return Poll::Pending;
+                    return Err(std::io::Error::new(ErrorKind::BrokenPipe, std::io::Error::from(ErrorKind::BrokenPipe)));
                 },
             }
         }
@@ -421,7 +404,7 @@ pub enum SessionEvent {
 }
 pub(crate) enum StreamState {
     Connected(Framed<TcpStream, Codec>),
-    Connecting(TcpStream),
+    //Connecting(TcpStream),
     Failed
 }
 pub struct Session {

@@ -294,10 +294,9 @@ macro_rules! header_list [
   });
   ($($key:expr => $value: expr), *) => ({
     let mut header_list = HeaderList::new();
-    $(header_list.push(Header::new($key, $value));)*
+    $(header_list.push(crate::header::Header::new($key, $value));)*
     header_list
   })
-
 ];
 
 #[test]

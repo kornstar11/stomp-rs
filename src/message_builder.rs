@@ -18,7 +18,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     #[allow(dead_code)]
-    pub fn send(self) {
+    pub async fn send(self) {
         if self.receipt_request.is_some() {
             let request = self.receipt_request.unwrap();
             self.session.state.outstanding_receipts.insert(
@@ -28,7 +28,7 @@ impl<'a> MessageBuilder<'a> {
                 )
             );
         }
-        self.session.send_frame(self.frame)
+        self.session.send_frame(self.frame).await
     }
 
     #[allow(dead_code)]
