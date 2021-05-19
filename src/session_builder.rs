@@ -7,7 +7,7 @@ use crate::header::HeaderList;
 use crate::option_setter::OptionSetter;
 use asynchronous_codec::Framed;
 use crate::codec::Codec;
-use crate::frame::Frame;
+use crate::errors::Error;
 
 #[derive(Clone)]
 pub struct SessionConfig {
@@ -32,7 +32,7 @@ impl SessionBuilder {
             credentials: None,
             heartbeat: HeartBeat(0, 0),
             headers: header_list![
-           "host" => host,
+           //"host" => host,
            "accept-version" => "1.2",
            "content-length" => "0"
           ],
@@ -43,16 +43,19 @@ impl SessionBuilder {
     }
 
     #[allow(dead_code)]
-    pub async fn start<'b, 'c>(self) -> ::std::io::Result<Session> {
+    pub async fn start<'b, 'c>(self) -> Result<Session, Error> {
         let address = (&self.config.host as &str, self.config.port)
-            .to_socket_addrs()?.nth(0)
-            .ok_or(io::Error::new(io::ErrorKind::Other, "address provided resolved to nothing"))?;
-        let tcp_stream = TcpStream::connect(&address).await?;
+            .to_socket_addrs()
+            .map_err(Error::Io)?
+            .nth(0)
+            .ok_or(Error::Io(io::Error::new(io::ErrorKind::Other, "address provided resolved to nothing")))?;
+        let tcp_stream = TcpStream::connect(&address)
+            .await
+            .map_err(Error::Io)?;
 
         let tcp_stream = Framed::new(tcp_stream, Codec);
         debug!("connected...");
-        let mut session = Session::new(self.config, tcp_stream).await;
-        Ok(session)
+        Session::new(self.config, tcp_stream).await
     }
 
     #[allow(dead_code)]

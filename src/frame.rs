@@ -1,5 +1,4 @@
 use crate::header::HeaderList;
-use crate::header::Header;
 use crate::subscription::AckMode;
 use std::str::from_utf8;
 use std::fmt;
@@ -151,7 +150,7 @@ impl Frame {
         debug!("write() complete.");
     }
 
-    pub fn connect(tx_heartbeat_ms: u32, rx_heartbeat_ms: u32) -> Frame { //TODO username,pass
+    pub fn connect(tx_heartbeat_ms: u32, rx_heartbeat_ms: u32) -> Frame {
         let heart_beat = format!("{},{}", tx_heartbeat_ms, rx_heartbeat_ms);
         let connect_frame = Frame {
             command: Command::Connect,

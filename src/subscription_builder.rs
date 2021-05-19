@@ -3,6 +3,7 @@ use crate::subscription::{Subscription, AckMode};
 use crate::frame::Frame;
 use crate::header::HeaderList;
 use crate::option_setter::OptionSetter;
+use crate::errors::Error;
 
 pub struct SubscriptionBuilder<'a> {
     pub session: &'a mut Session,
@@ -24,8 +25,7 @@ impl<'a> SubscriptionBuilder<'a> {
                 }
     }
 
-    //#[allow(dead_code)]
-    pub async fn start(mut self) -> String {
+    pub async fn start(mut self) -> Result<String, Error> {
         let next_id = self.session.generate_subscription_id();
         let subscription = Subscription::new(next_id,
                                              &self.destination,
@@ -36,8 +36,7 @@ impl<'a> SubscriptionBuilder<'a> {
                                                    self.ack_mode);
 
         subscribe_frame.headers.concat(&mut self.headers);
-        //debug!("Sending subscribe frame {:?}", subscribe_frame);
-        self.session.send_frame(subscribe_frame.clone()).await;
+        self.session.send_frame(subscribe_frame.clone()).await?;
 
         debug!("Registering callback for subscription id '{}' from builder",
                subscription.id);
@@ -52,7 +51,7 @@ impl<'a> SubscriptionBuilder<'a> {
                 )
             );
         }
-        id_to_return
+        Ok(id_to_return)
     }
 
     #[allow(dead_code)]

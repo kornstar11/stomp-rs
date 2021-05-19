@@ -24,10 +24,11 @@ async fn run() -> Result<(), Error> {
             .await
             .unwrap();
         loop {
-            let sent = publish_session.message(destination, "Modern major general")
+            publish_session.message(destination, "Modern major general")
                 .with(ContentType("text/plain"))
                 .send()
-                .await;
+                .await
+                .unwrap();
             messages_sent += 1;
             if messages_sent % INTERVAL == 0 {
                 println!("{} messages sent", messages_sent);
@@ -37,9 +38,8 @@ async fn run() -> Result<(), Error> {
                 break;
             }
         }
-        let _ = publish_session.disconnect();
+        publish_session.disconnect().await.unwrap();
         println!("Disconnected.");
-
     });
 
     smol::Timer::after(Duration::from_millis(5000)).await;
@@ -47,14 +47,16 @@ async fn run() -> Result<(), Error> {
 
     let mut subscribe_session = stomp::SessionBuilder::new("127.0.0.1", 61613)
         .start()
-        .await?;
+        .await
+        .unwrap();
 
     println!("Done connecting");
 
     let id = subscribe_session
         .subscription(destination)
         .start()
-        .await;
+        .await
+        .unwrap();
     println!("Done subscribing {}", id);
 
     let recv = subscribe_session.take(1).collect::<Vec<_>>().await;

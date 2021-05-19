@@ -120,7 +120,7 @@ impl Decoder for Codec {
             IResult::Incomplete(_) => return Ok(None)
         };
         let len = src.len().saturating_sub(point);
-        src.split_to(len);
+        let _ = src.split_to(len); //dumb, can get to the Buf trait to make advance work
         Ok(Some(data))
     }
 }

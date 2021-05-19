@@ -1,5 +1,5 @@
 use std::collections::hash_map::HashMap;
-use std::io::{Result, ErrorKind};
+use std::io::{ErrorKind};
 use futures::*;
 use async_net::TcpStream;
 use futures::task::{Poll, Context};
@@ -9,6 +9,7 @@ use asynchronous_codec::Framed;
 use futures::future::FutureExt;
 use futures::future::Future;
 use futures::sink::SinkExt;
+use crate::errors::Error;
 use crate::frame::Transmission::{HeartBeat, CompleteFrame};
 use crate::frame::{Frame, Transmission, ToFrameBody, Command};
 use crate::message_builder::MessageBuilder ;
@@ -19,6 +20,8 @@ use crate::codec::Codec;
 use crate::session_builder::SessionConfig;
 use crate::header::Header;
 use smol::stream::StreamExt;
+
+type Result<T> = std::result::Result<T, Error>;
 
 
 const GRACE_PERIOD_MULTIPLIER: f32 = 2.0;
@@ -46,9 +49,8 @@ impl ReceiptRequest {
         }
     }
 }
-
+#[derive(Default)]
 pub struct SessionState {
-    next_transaction_id: u32,
     next_subscription_id: u32,
     next_receipt_id: u32,
     pub rx_heartbeat_ms: Option<u32>,
@@ -59,25 +61,9 @@ pub struct SessionState {
     pub outstanding_receipts: HashMap<String, OutstandingReceipt>
 }
 
-impl SessionState {
-    pub fn new() -> SessionState {
-        SessionState {
-            next_transaction_id: 0,
-            next_subscription_id: 0,
-            next_receipt_id: 0,
-            rx_heartbeat_ms: None,
-            rx_heartbeat_timeout: None,
-            tx_heartbeat_ms: None,
-            tx_heartbeat_timeout: None,
-            subscriptions: HashMap::new(),
-            outstanding_receipts: HashMap::new(),
-        }
-    }
-}
-
 // *** Public API ***
 impl Session {
-    pub async fn send_frame(&mut self, fr: Frame) {
+    pub async fn send_frame(&mut self, fr: Frame) -> Result<()> {
         self.send(Transmission::CompleteFrame(fr)).await
     }
     pub fn message<T: ToFrameBody>(&mut self,
@@ -95,20 +81,14 @@ impl Session {
         SubscriptionBuilder::new(self, destination.to_owned())
     }
 
-    // pub fn begin_transaction<'b>(&'b mut self) -> Transaction<'b> {
-    //     let mut transaction = Transaction::new(self);
-    //     let _ = transaction.begin();
-    //     transaction
-    // }
-
-    pub async fn unsubscribe(&mut self, sub_id: &str) {
+    pub async fn unsubscribe(&mut self, sub_id: &str) -> Result<()> {
         self.state.subscriptions.remove(sub_id);
         let unsubscribe_frame = Frame::unsubscribe(sub_id.as_ref());
         self.send(CompleteFrame(unsubscribe_frame)).await
     }
 
-    pub async fn disconnect(&mut self) {
-        self.send_frame(Frame::disconnect()).await;
+    pub async fn disconnect(&mut self) -> Result<()> {
+        self.send_frame(Frame::disconnect()).await
     }
     // pub fn reconnect(&mut self) -> ::std::io::Result<()> {
     //     use std::net::ToSocketAddrs;
@@ -123,7 +103,7 @@ impl Session {
     //     task::current().notify();
     //     Ok(())
     // }
-    pub async fn acknowledge_frame(&mut self, frame: &Frame, which: AckOrNack) {
+    pub async fn acknowledge_frame(&mut self, frame: &Frame, which: AckOrNack) -> Result<()> {
         if let Some(crate::header::Ack(ack_id)) = frame.headers.get_ack() {
             let ack_frame = if let AckOrNack::Ack = which {
                 Frame::ack(ack_id)
@@ -131,27 +111,23 @@ impl Session {
             else {
                 Frame::nack(ack_id)
             };
-            self.send_frame(ack_frame).await;
+            return self.send_frame(ack_frame).await;
         }
+        Ok(())
     }
 }
 // *** pub(crate) API ***
 impl Session {
-    pub(crate) async fn new(config: SessionConfig, stream: Framed<TcpStream, Codec>) -> Self {
+    pub(crate) async fn new(config: SessionConfig, stream: Framed<TcpStream, Codec>) -> Result<Self> {
         let mut session = Self {
             config,
-            state: SessionState::new(),
-            //events: vec![],
+            state: SessionState::default(),
             stream: StreamState::Connected(stream),
         };
 
-        session.do_connect().await;
-        session
-    }
-    pub(crate) fn generate_transaction_id(&mut self) -> u32 {
-        let id = self.state.next_transaction_id;
-        self.state.next_transaction_id += 1;
-        id
+        //session.do_connect().await;
+        session.on_stream_ready().await?;
+        Ok(session)
     }
 
     pub(crate) fn generate_subscription_id(&mut self) -> u32 {
@@ -168,7 +144,7 @@ impl Session {
 }
 // *** Internal API ***
 impl Session {
-    async fn _send(&mut self, tx: Transmission) -> Result<()> {
+    async fn _send(&mut self, tx: Transmission) -> std::result::Result<(), std::io::Error> {
         if let StreamState::Connected(ref mut st) = self.stream {
             debug!("Stream is sending");
             st.send(tx).await?;
@@ -179,21 +155,21 @@ impl Session {
         }
         Ok(())
     }
-    async fn send(&mut self, tx: Transmission) {
+    async fn send(&mut self, tx: Transmission) -> Result<()> {
         debug!("send() {:?}", tx);
         if let Err(e) = self._send(tx).await {
-            self.on_disconnect(DisconnectionReason::SendFailed(e));
+            let io_err: std::io::Error = std::io::Error::from(e.kind());
+            self.on_disconnect(DisconnectionReason::SendFailed(io_err));
+            return Err(Error::Io(e));
         }
         debug!("send() end");
+        Ok(())
     }
     fn register_tx_heartbeat_timeout(&mut self) -> Result<()> {
         use std::time::Duration;
-        if self.state.tx_heartbeat_ms.is_none() {
-            warn!("Trying to register TX heartbeat timeout, but not set!");
-            return Ok(());
-        }
-        let tx_heartbeat_ms = self.state.tx_heartbeat_ms.unwrap(); //TODO return result
-        if tx_heartbeat_ms <= 0 {
+
+        let tx_heartbeat_ms = self.state.tx_heartbeat_ms.unwrap_or(0);
+        if tx_heartbeat_ms == 0 {
             debug!("Heartbeat transmission ms is {}, no need to register a callback.",
                    tx_heartbeat_ms);
             return Ok(());
@@ -206,14 +182,8 @@ impl Session {
     fn register_rx_heartbeat_timeout(&mut self) -> Result<()> {
         use std::time::Duration;
 
-        let rx_heartbeat_ms = self.state.rx_heartbeat_ms
-            .unwrap_or_else(|| {
-                debug!("Trying to register RX heartbeat timeout but no \
-                        rx_heartbeat_ms was set. This is expected for receipt \
-                        of CONNECTED.");
-                0
-            });
-        if rx_heartbeat_ms <= 0 {
+        let rx_heartbeat_ms = self.state.rx_heartbeat_ms.unwrap_or(0);
+        if rx_heartbeat_ms == 0 {
             debug!("Heartbeat receipt ms is {}, no need to register a callback.",
                    rx_heartbeat_ms);
             return Ok(());
@@ -224,22 +194,19 @@ impl Session {
     }
 
     fn on_recv_data(&mut self) -> Result<()> {
-        if self.state.rx_heartbeat_ms.is_some() {
-            self.register_rx_heartbeat_timeout()?;
-        }
+        self.register_rx_heartbeat_timeout()?;
         Ok(())
     }
 
     async fn reply_to_heartbeat(&mut self) -> Result<()> {
         debug!("Sending heartbeat");
-        self.send(HeartBeat).await;
+        self.send(HeartBeat).await?;
         self.register_tx_heartbeat_timeout()?;
         Ok(())
     }
 
     fn on_disconnect(&mut self, reason: DisconnectionReason) {
         info!("Disconnected. Reason: {:?}", reason);
-        //self.events.push(SessionEvent::Disconnected(reason));
         if let StreamState::Connected(ref mut strm) = self.stream {
             let _ = strm.shutdown(::std::net::Shutdown::Both); //TODO handle result?
         }
@@ -248,7 +215,7 @@ impl Session {
         self.state.rx_heartbeat_timeout = None;
     }
 
-    async fn on_stream_ready(&mut self) {
+    async fn on_stream_ready(&mut self) -> Result<()>{
         debug!("Stream ready!");
         // Add credentials to the header list if specified
         match self.config.credentials.clone() { // TODO: Refactor to avoid clone
@@ -256,7 +223,7 @@ impl Session {
                 debug!("Using provided credentials: login '{}', passcode '{}'",
                        credentials.login,
                        credentials.passcode);
-                let mut headers = &mut self.config.headers;
+                let headers = &mut self.config.headers;
                 headers.push(Header::new("login", &credentials.login));
                 headers.push(Header::new("passcode", &credentials.passcode));
             }
@@ -274,7 +241,8 @@ impl Session {
             body: Vec::new(),
         };
 
-        self.send_frame(connect_frame).await;
+        self.send_frame(connect_frame).await?;
+        self.run_stream().await.map(|_| ())
     }
     fn on_message(&mut self, frame: Frame) -> SessionEvent {
         let mut sub_data = None;
@@ -293,12 +261,6 @@ impl Session {
         else {
             SessionEvent::SubscriptionlessFrame(frame)
         }
-    }
-
-    async fn do_connect(&mut self) {
-        let connect = Frame::connect(self.config.heartbeat.0, self.config.heartbeat.1);
-        self.send_frame(connect).await;
-        self.run_stream().await;
     }
 
     fn on_connected_frame_received(&mut self, connected_frame: Frame) -> Result<SessionEvent> {
@@ -382,7 +344,7 @@ impl Session {
                     },
                     Some(Err(e)) => {
                         debug!("Got Error {:?}", e);
-                        let ret = Err(std::io::Error::from(e.kind()));
+                        let ret = Err(Error::from(&e));
                         self.on_disconnect(DisconnectionReason::RecvFailed(e));
                         return ret;
                     },
@@ -390,7 +352,7 @@ impl Session {
             },
             Failed => {
                 println!("error");
-                return Err(std::io::Error::new(ErrorKind::BrokenPipe, std::io::Error::from(ErrorKind::BrokenPipe)));
+                return Err(Error::Disconnected);
             },
         }
     }
@@ -411,7 +373,9 @@ impl Session {
                         debug!("Received frame: {:?}", frame);
                         self.on_recv_data()?;
                         match frame.command {
-                            Command::Error => Some(SessionEvent::ErrorFrame(frame)),
+                            Command::Error => {
+                                return Err(Error::from(&frame));
+                            },
                             Command::Receipt => self.handle_receipt(frame),
                             Command::Connected => Some(self.on_connected_frame_received(frame)?),
                             Command::Message => Some(self.on_message(frame)),
@@ -440,7 +404,7 @@ impl Session {
                 return Ok(None);
             },
             Err(e) => {
-                return Err(std::io::Error::from(e.kind()))
+                return Err(e);
             }
         }
     }
@@ -499,7 +463,7 @@ impl Stream for Session {
                     return Poll::Ready(Some(Err(e)));
                 },
                 Poll::Ready(Ok(None)) => {
-                    //return Poll::Ready(Some(Ok(None)));
+                    // a noop do another loop
                 },
                 Poll::Ready(Ok(Some(event))) => {
                     return Poll::Ready(Some(Ok(event)));

@@ -1,20 +1,16 @@
 #![crate_name = "stomp"]
 #![crate_type = "lib"]
 
+#![deny(unused, dead_code, non_snake_case)]
+
 #[macro_use]
 extern crate log;
-extern crate futures;
-extern crate unicode_segmentation;
-extern crate bytes;
 #[macro_use]
 extern crate nom;
-extern crate async_net;
-extern crate smol;
-extern crate asynchronous_codec;
 
 pub mod connection;
 pub mod header;
-pub mod codec;
+mod codec;
 pub mod frame;
 pub mod session;
 pub mod subscription;
@@ -23,5 +19,7 @@ pub mod message_builder;
 pub mod session_builder;
 pub mod subscription_builder;
 pub mod option_setter;
+pub mod errors;
+
 
 pub use session_builder::SessionBuilder;

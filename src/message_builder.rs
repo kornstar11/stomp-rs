@@ -1,6 +1,7 @@
 use crate::session::{Session, ReceiptRequest, OutstandingReceipt};
 use crate::frame::Frame;
 use crate::option_setter::OptionSetter;
+use crate::errors::Error;
 
 pub struct MessageBuilder<'a> {
     pub session: &'a mut Session,
@@ -18,7 +19,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     #[allow(dead_code)]
-    pub async fn send(self) {
+    pub async fn send(self) -> Result<(), Error> {
         if self.receipt_request.is_some() {
             let request = self.receipt_request.unwrap();
             self.session.state.outstanding_receipts.insert(
