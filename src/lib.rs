@@ -23,3 +23,5 @@ pub mod message_builder;
 pub mod session_builder;
 pub mod subscription_builder;
 pub mod option_setter;
+
+pub use session_builder::SessionBuilder;

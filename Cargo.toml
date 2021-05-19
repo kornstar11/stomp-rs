@@ -23,5 +23,12 @@ nom = "3.2"
 
 unicode-segmentation = "0.1"
 
+[dev-dependencies]
+env_logger = "0.8.3"
+
 [lib]
 name = "stomp"
+
+[[example]]
+name = "stomp-examples"
+path = "examples"

@@ -80,17 +80,17 @@ impl Session {
     pub async fn send_frame(&mut self, fr: Frame) {
         self.send(Transmission::CompleteFrame(fr)).await
     }
-    pub fn message<'builder, T: ToFrameBody>(&'builder mut self,
-                                             destination: &str,
-                                             body_convertible: T)
-                                             -> MessageBuilder<'builder> {
+    pub fn message<T: ToFrameBody>(&mut self,
+                                   destination: &str,
+                                   body_convertible: T)
+                                   -> MessageBuilder {
         let send_frame = Frame::send(destination, body_convertible.to_frame_body());
         MessageBuilder::new(self, send_frame)
     }
 
-    pub fn subscription<'builder>(&'builder mut self,
-                                  destination: &str)
-                                  -> SubscriptionBuilder<'builder>
+    pub fn subscription(&mut self,
+                        destination: &str)
+                        -> SubscriptionBuilder
     {
         SubscriptionBuilder::new(self, destination.to_owned())
     }
@@ -137,13 +137,17 @@ impl Session {
 }
 // *** pub(crate) API ***
 impl Session {
-    pub(crate) fn new(config: SessionConfig, stream: Framed<TcpStream, Codec>) -> Self {
-        Self {
+    pub(crate) async fn new(config: SessionConfig, stream: Framed<TcpStream, Codec>) -> Self {
+        let mut session = Self {
             config,
             state: SessionState::new(),
             //events: vec![],
-            stream: StreamState::Connected(stream)
-        }
+            stream: StreamState::Connected(stream),
+            poll_read_fut: None,
+        };
+
+        session.do_connect().await;
+        session
     }
     pub(crate) fn generate_transaction_id(&mut self) -> u32 {
         let id = self.state.next_transaction_id;
@@ -167,7 +171,9 @@ impl Session {
 impl Session {
     async fn _send(&mut self, tx: Transmission) -> Result<()> {
         if let StreamState::Connected(ref mut st) = self.stream {
+            debug!("Stream is sending");
             st.send(tx).await?;
+            debug!("Stream DONE is sending");
         }
         else {
             warn!("sending {:?} whilst disconnected", tx);
@@ -175,9 +181,11 @@ impl Session {
         Ok(())
     }
     async fn send(&mut self, tx: Transmission) {
+        debug!("send() {:?}", tx);
         if let Err(e) = self._send(tx).await {
             self.on_disconnect(DisconnectionReason::SendFailed(e));
         }
+        debug!("send() end");
     }
     fn register_tx_heartbeat_timeout(&mut self) -> Result<()> {
         use std::time::Duration;
@@ -288,7 +296,14 @@ impl Session {
         }
     }
 
+    async fn do_connect(&mut self) {
+        let connect = Frame::connect(self.config.heartbeat.0, self.config.heartbeat.1);
+        self.send_frame(connect).await;
+        self.run_stream().await;
+    }
+
     fn on_connected_frame_received(&mut self, connected_frame: Frame) -> Result<SessionEvent> {
+        debug!("Server confirms connection!");
         // The Client's requested tx/rx HeartBeat timeouts
         let crate::connection::HeartBeat(client_tx_ms, client_rx_ms) = self.config.heartbeat;
 
@@ -340,6 +355,7 @@ impl Session {
     async fn poll_stream_complete(&mut self) {
         let res = {
             if let StreamState::Connected(ref mut fr) = self.stream {
+                debug!("Attempt flush");
                 fr.flush().await // https://docs.rs/tokio-io/0.1.2/tokio_io/codec/struct.Framed.html#method.poll_complete
             }
             else {
@@ -354,16 +370,20 @@ impl Session {
         use self::StreamState::*;
         match ::std::mem::replace(&mut self.stream, Failed) {
             Connected(mut fr) => {
+                println!("connected ");
                 match fr.next().await {
                     Some(Ok(r)) => {
+                        debug!("Got {:?}", r);
                         self.stream = Connected(fr);
                         return Ok(Some(r));
                     },
                     None => {
+                        debug!("Got None");
                         self.on_disconnect(DisconnectionReason::ClosedByOtherSide);
                         return Ok(None);
                     },
                     Some(Err(e)) => {
+                        debug!("Got Error {:?}", e);
                         let ret = Err(std::io::Error::from(e.kind()));
                         self.on_disconnect(DisconnectionReason::RecvFailed(e));
                         return ret;
@@ -371,6 +391,7 @@ impl Session {
                 }
             },
             Failed => {
+                println!("error");
                 return Err(std::io::Error::new(ErrorKind::BrokenPipe, std::io::Error::from(ErrorKind::BrokenPipe)));
             },
         }
@@ -378,6 +399,7 @@ impl Session {
 
     async fn run_stream(&mut self) -> Result<Option<SessionEvent>> {
         use crate::frame::Transmission::*;
+        println!("Called");
 
         match self.poll_stream().await {
             Ok(Some(val)) => {
@@ -414,7 +436,6 @@ impl Session {
 
                 self.poll_stream_complete().await;
 
-
                 return Ok(event);
             },
             Ok(None) => {
@@ -435,6 +456,7 @@ pub enum DisconnectionReason {
     HeartbeatTimeout,
     Requested
 }
+#[derive(Debug)]
 pub enum SessionEvent {
     Connected,
     ErrorFrame(Frame),
@@ -460,6 +482,7 @@ pub struct Session {
     config: SessionConfig,
     pub(crate) state: SessionState,
     stream: StreamState,
+    poll_read_fut: Option<Pin<Box<dyn Future<Output = Result<Option<SessionEvent>>>>>>,
 }
 
 
@@ -467,13 +490,26 @@ impl Stream for Session {
     type Item = Result<SessionEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut boxed = self.run_stream().boxed();
-        match Pin::new(&mut boxed).poll(cx) {
-            Poll::Pending => {
-                return Poll::Pending;
-            },
-            Poll::Ready(res_opt) => {
-                Poll::Ready(None)
+        loop {
+            if let Some(mut fut) = std::mem::take(&mut self.get_mut().poll_read_fut) {
+                match Pin::new(&mut fut).poll(cx) {
+                    Poll::Pending => {
+                        self.get_mut().poll_read_fut = Some(fut);
+                        return Poll::Pending;
+                    },
+                    Poll::Ready(Ok(None)) => {
+                        return Poll::Ready(None);
+                    },
+                    Poll::Ready(Ok(Some(event))) => {
+                        return Poll::Ready(Some(Ok(event)));
+                    },
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+            } else {
+                let boxed = self.run_stream().boxed();
+                self.get_mut().poll_read_fut = Some(boxed);
             }
         }
     }

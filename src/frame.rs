@@ -151,7 +151,7 @@ impl Frame {
         debug!("write() complete.");
     }
 
-    pub fn connect(tx_heartbeat_ms: u32, rx_heartbeat_ms: u32) -> Frame {
+    pub fn connect(tx_heartbeat_ms: u32, rx_heartbeat_ms: u32) -> Frame { //TODO username,pass
         let heart_beat = format!("{},{}", tx_heartbeat_ms, rx_heartbeat_ms);
         let connect_frame = Frame {
             command: Command::Connect,

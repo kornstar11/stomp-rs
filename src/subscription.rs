@@ -1,6 +1,6 @@
 use crate::header::HeaderList;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum AckMode {
     Auto,
     Client,
