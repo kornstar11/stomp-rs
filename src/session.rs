@@ -143,7 +143,6 @@ impl Session {
             state: SessionState::new(),
             //events: vec![],
             stream: StreamState::Connected(stream),
-            poll_read_fut: None,
         };
 
         session.do_connect().await;
@@ -173,7 +172,7 @@ impl Session {
         if let StreamState::Connected(ref mut st) = self.stream {
             debug!("Stream is sending");
             st.send(tx).await?;
-            debug!("Stream DONE is sending");
+            debug!("Stream is done sending");
         }
         else {
             warn!("sending {:?} whilst disconnected", tx);
@@ -368,13 +367,12 @@ impl Session {
     }
     async fn poll_stream(&mut self) -> Result<Option<Transmission>> {
         use self::StreamState::*;
-        match ::std::mem::replace(&mut self.stream, Failed) {
-            Connected(mut fr) => {
+        match &mut self.stream {
+            Connected(fr) => {
                 println!("connected ");
                 match fr.next().await {
                     Some(Ok(r)) => {
-                        debug!("Got {:?}", r);
-                        self.stream = Connected(fr);
+                        debug!("poll_stream got {:?}", r);
                         return Ok(Some(r));
                     },
                     None => {
@@ -482,7 +480,6 @@ pub struct Session {
     config: SessionConfig,
     pub(crate) state: SessionState,
     stream: StreamState,
-    poll_read_fut: Option<Pin<Box<dyn Future<Output = Result<Option<SessionEvent>>>>>>,
 }
 
 
@@ -491,25 +488,22 @@ impl Stream for Session {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(mut fut) = std::mem::take(&mut self.get_mut().poll_read_fut) {
-                match Pin::new(&mut fut).poll(cx) {
-                    Poll::Pending => {
-                        self.get_mut().poll_read_fut = Some(fut);
-                        return Poll::Pending;
-                    },
-                    Poll::Ready(Ok(None)) => {
-                        return Poll::Ready(None);
-                    },
-                    Poll::Ready(Ok(Some(event))) => {
-                        return Poll::Ready(Some(Ok(event)));
-                    },
-                    Poll::Ready(Err(e)) => {
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                }
-            } else {
-                let boxed = self.run_stream().boxed();
-                self.get_mut().poll_read_fut = Some(boxed);
+            let mut next = self.run_stream().boxed();
+            let next = Pin::new(&mut next).poll(cx);
+            debug!("next: {:?}", next);
+            match next {
+                Poll::Pending => {
+                    return Poll::Pending;
+                },
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Some(Err(e)));
+                },
+                Poll::Ready(Ok(None)) => {
+                    //return Poll::Ready(Some(Ok(None)));
+                },
+                Poll::Ready(Ok(Some(event))) => {
+                    return Poll::Ready(Some(Ok(event)));
+                },
             }
         }
     }

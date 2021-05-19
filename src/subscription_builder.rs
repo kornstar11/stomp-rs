@@ -24,8 +24,8 @@ impl<'a> SubscriptionBuilder<'a> {
                 }
     }
 
-    #[allow(dead_code)]
-    pub fn start(mut self) -> String {
+    //#[allow(dead_code)]
+    pub async fn start(mut self) -> String {
         let next_id = self.session.generate_subscription_id();
         let subscription = Subscription::new(next_id,
                                              &self.destination,
@@ -36,8 +36,8 @@ impl<'a> SubscriptionBuilder<'a> {
                                                    self.ack_mode);
 
         subscribe_frame.headers.concat(&mut self.headers);
-
-        self.session.send_frame(subscribe_frame.clone());
+        //debug!("Sending subscribe frame {:?}", subscribe_frame);
+        self.session.send_frame(subscribe_frame.clone()).await;
 
         debug!("Registering callback for subscription id '{}' from builder",
                subscription.id);

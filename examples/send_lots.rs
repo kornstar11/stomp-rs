@@ -49,11 +49,19 @@ async fn run() -> Result<(), Error> {
         .start()
         .await?;
 
+    println!("Done connecting");
+
     let id = subscribe_session
         .subscription(destination)
-        .start();
+        .start()
+        .await;
+    println!("Done subscribing {}", id);
 
-    let recv = subscribe_session.collect::<Vec<_>>().await;
+    let recv = subscribe_session.take(1).collect::<Vec<_>>().await;
+
+    //subscribe_session.disconnect().await;
+
+    //let recv = recv.await;
 
 
     println!("Recv: {:?}", recv);
